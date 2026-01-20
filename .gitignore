@@ -1,0 +1,6 @@
+# Exclude the reference directory
+reference/
+
+# Exclude any folder or file starting with tmp or temp
+tmp*/
+temp*/
