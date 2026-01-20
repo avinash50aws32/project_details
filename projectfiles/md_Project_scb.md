@@ -43,15 +43,19 @@ Integrated payment processing system handling corporate remittance with automate
 
 ```TECH
 [Payment Web Portal - React TypeScript Frontend + ASP.NET Core 8 Backend]
-**Hosting:** Frontend on Azure Static Web Apps, Backend API on Azure App Service (Premium P1V2), All microservices on Azure Kubernetes Service (AKS) with auto-scaling
+**Hosting:** Frontend on Azure Static Web Apps, Backend API on Azure App Service (Premium P1V2), All microservices on Azure Kubernetes Service (AKS) with Horizontal Pod Autoscaler/auto-scaling (HPA) based on CPU/memory
 
 **Authentication & Authorization Flow:**
 - **User Authentication:** Azure AD B2C for external clients, Azure AD for internal employees
 - **User Authorization:** RBAC via Azure AD groups/roles (ClientOnboardingAgent, BranchOfficer)
 - **Frontend → Backend API:** React calls Backend API with user JWT token (from Azure AD authentication)
+- **Backend API → Azure SQL Database:** ASP.NET Core (App Service) uses Managed Identity (MI) for secure access to Azure SQL Database
 - **Backend API → Microservices:** ASP.NET Core (App Service) acts as API Gateway, routes to AKS microservices with service JWT
 - **Microservices ↔ Microservices:** Call each other via REST APIs with JWT bearer tokens for authentication
-- **Microservices → Azure Resources:** Managed Identity for AKS pods accessing Blob Storage, SQL Database, Service Bus, Key Vault
+- **Microservices → Azure Resources:** Managed Identity (to authenticate with AD) for AKS pods accessing Blob Storage, SQL Database, Service Bus, Key Vault
+- **Azure Function/Logic App → Microservices:** MI (to authenticate with AD and obtain a JWT token) via REST APIs with JWT bearer tokens for authentication
+- **Event Grid/Service Bus/Storage Queue → Microservices:** Message triggers Azure Function / Logic App, which follows same path as above to access microservices.
+- **Azure Resources ↔ Azure Resources:** Managed Identity
 ```
 
 #### Stage 1: Document Upload & Form Preparation
@@ -65,38 +69,36 @@ Integrated payment processing system handling corporate remittance with automate
 - Client/Corp User:
   - Prints form, obtains required authority signatures, attaches supporting documents
   - Uploads signed forms and supporting documents (2D/non-2D) scanned and uploaded (at branch or online)
-- Backend system:
+- Backend system -> File Upload Microservice:
   - Uploads scanned documents to Azure Blob Storage with unique tracking ID
 
 ```TECH - **F1S1: System interaction**
-
 [Payment Web Portal - React TypeScript + ASP.NET Core 8]
 → Input: Client registration request from web browser (corporate client self-service or branch employee assisted)
 → Actions:
-   **Primary Path - Corporate Client Self-Registration (Self-Service Onboarding):**
-   • Client accesses bank's corporate onboarding portal via public website
-   • Client creates account with Azure AD B2C:
-     - Provides corporate email (e.g., cfo@company.com)
-     - Email verification via OTP (6-digit code sent to email)
-     - Sets password meeting complexity requirements
-     - No MFA required for initial registration (added post-approval)
-   • Azure AD B2C creates guest user account with basic permissions (can only access onboarding forms)
-   • Client fills onboarding form via React UI:
-     - Company details (legal name, registration number, tax ID, incorporation country)
-     - Business type and industry
-     - Authorized signatories (names, titles, email addresses)
-     - Bank account details (currency, account type, expected transaction volumes)
-     - Contact information (registered address, phone, website)
-
-   **Alternative Path - Branch Employee Assisted (In-Person or Phone Onboarding):**
-   • Branch employee authenticates with OAuth 2.0 + MFA (Azure AD integration)
-   • RBAC validates employee permissions (role: ClientOnboardingAgent, BranchOfficer)
-   • Employee fills form on behalf of client during branch visit or phone call
-   • Employee ID tracked in submission record for audit trail
-
-   • ASP.NET Core backend validates input, generates pre-filled PDF with embedded barcode (ZXing.Net)
-   • EF Core 8 inserts client submission record (Set A) into Azure SQL Database (ClientSubmissions table)
-   • Redis Cache stores session data (30-min TTL) for multi-step form progress
+   - Form completion:
+      - **Primary Path - Corporate Client Self-Registration (Self-Service Onboarding):**
+         - Client accesses bank's corporate onboarding portal via public website
+         - Client creates account with Azure AD B2C:
+            - Provides corporate email (e.g., cfo@company.com)
+            - Email verification via OTP (6-digit code sent to email)
+            - Sets password meeting complexity requirements
+            - No MFA required for initial registration (added post-approval)
+         - Azure AD B2C creates guest user account with basic permissions (can only access onboarding forms)
+         - Client fills onboarding form via React UI:
+         - Company details (legal name, registration number, tax ID, incorporation country)
+         - Business type and industry
+         - Authorized signatories (names, titles, email addresses)
+         - Bank account details (currency, account type, expected transaction volumes)
+         - Contact information (registered address, phone, website)
+      - **Alternative Path - Branch Employee Assisted (In-Person or Phone Onboarding):**
+         - Branch employee authenticates with OAuth 2.0 + MFA (Azure AD integration)
+         - RBAC validates employee permissions (role: ClientOnboardingAgent, BranchOfficer)
+         - Employee fills form on behalf of client during branch visit or phone call
+         - Employee ID tracked in submission record for audit trail
+   - ASP.NET Core backend validates input, generates pre-filled PDF with embedded barcode (ZXing.Net)
+   - EF Core 8 inserts client submission record (Set A) into Azure SQL Database (ClientSubmissions table)
+   - Redis Cache stores session data (30-min TTL) for multi-step form progress
 → Output: Returns unique Submission ID and barcode-embedded PDF to client
 
 [Client Action - Offline]
@@ -119,13 +121,17 @@ Integrated payment processing system handling corporate remittance with automate
          - Submission status remains: Draft (not PendingProcessing)
          - Client can add/replace documents and resubmit
          - No Azure storage costs incurred for incomplete submissions
-
    • Backend processes upload (only after completeness validation passes):
-     - Uploads documents to Azure Blob Storage container (onboarding-docs) with unique tracking ID
-     - Publishes message to Azure Storage queue (onboarding-processing-queue) with JSON payload:
-       {submissionId, blobUrls[], documentTypes[], uploadTimestamp}
+     - Calls File Upload Microservice to handle document upload to Azure Blob Storage container (onboarding-docs) with unique tracking ID
 → Output: Returns upload confirmation with tracking ID to client, message queued for processing
 
+[File Upload Service - .NET Core 8 Microservice]
+→ Input: Scanned document upload request (PDF/images) from client
+     - Uploads documents to azure storage container
+     - Publishes message to Azure Storage queue (process-onboarding-queue) with JSON payload:
+       {submissionId, blobUrls[], documentTypes[], uploadTimestamp}
+     - returns upload confirmation to calling service
+→ Output: Returns upload confirmation with tracking ID to client
 ```
 
 #### Stage 2: AI Document Processing:
@@ -142,25 +148,29 @@ Integrated payment processing system handling corporate remittance with automate
   - Returns extracted entity level data with confidence scoring (High >95%, Medium 85-95%, Low <85%)
 - Azure Function:
   - Saves OCR extract data and confidence score to database (Set C)
+  - Publishes extraction completion message to Azure Service Bus (validation-queue)
 
 ```TECH - **F1S2: System interaction**
 [Azure Storage Queue]
-→ Event: New message added to Azure Storage Queue (onboarding-processing-queue) triggers Azure Function (QueueTrigger)
+→ Event: New message added to Azure Storage Queue (process-onboarding-queue) triggers Azure Function (QueueTrigger)
 
 [Azure Function - Document Processor (.NET Core 8)]
 **Hosting:** Azure Functions Consumption Plan (auto-scales, pay-per-execution)
 
-→ Input: Blob upload event from Azure Blob Storage (onboarding-docs container) with document metadata
+→ Input: Message from Azure Storage Queue (process-onboarding-queue) with JSON payload:
+   {submissionId, blobUrls[], documentTypes[], uploadTimestamp}
 → Actions:
-   • Retrieves document from Azure Blob Storage to Azure Function memory (BlobClient.DownloadAsync())
-   • Barcode extraction using ZXing.Net BarcodeReader:
+   - Retrieves document metadata from the message payload
+   - Retrieves document from Azure Blob Storage using blobUrls[] (BlobClient.DownloadAsync()) to Azure Function memory
+   - Barcode extraction using ZXing.Net BarcodeReader:
      - Decodes QR code from scanned form
      - Extracts embedded JSON (Company Name, Tax ID, Bank Account - AES-256 encrypted)
      - Saves barcode data (Set B) to Azure SQL Database (BarcodeExtractions table)
-   • Posts document to Azure AI Document Intelligence REST API (POST /formrecognizer/documentModels/prebuilt-document:analyze)
-   • Receives OCR results with confidence scores for each field
-   • Saves OCR extracted data (Set C) to Azure SQL (OCRExtractions table)
-   • Publishes completion message to Azure Service Bus (validation-queue)
+   - Posts document to Azure AI Document Intelligence REST API (POST /formrecognizer/documentModels/prebuilt-document:analyze)
+   - Receives OCR results with confidence scores for each field
+   - Saves OCR extracted data (Set C) to Azure SQL (OCRExtractions table)
+   - Publishes extraction completion message to Azure Service Bus (validation-queue) with JSON payload:
+     {submissionId, extractedData, confidenceScores, timestamp}
 → Output: Sets B and C stored in Azure SQL, message in validation-queue
 ```
 
@@ -173,81 +183,104 @@ Integrated payment processing system handling corporate remittance with automate
     - Compare bank account numbers
     - Flag discrepancies for manual review
   - Creates finalized entity set (Set D) with merged/corrected data and stores it in db
+  - Publishes set comparison completion message to Azure Service Bus (business-rule-validation-queue)
 
 - Business Rule Validation Engine:
-  - Validate extracted data against barcode data against business rules from service now:
+  - Fetches business rules from ServiceNow
+  - Validate extracted data against business rules from service now:
     - Tax ID format verification
     - Bank account number validation
     - Duplicate client check
-    - Sanction list screening
+    - Sanction list screening by calling Compliance Service
   - Makes Decision and routs transaction to appropriate next step:
-    - High Confidence + All Rules Pass → Auto-Approve
-    - Medium Confidence or Partial Rules → Manual Review Queue
-    - Low Confidence or Rules Fail → Rejection with reason
+    - High Confidence + All Rules Pass → Publishes to Service Bus (auto-approval-topic)
+    - Medium Confidence or Partial Rules → Publishes to Service Bus (manual-review-queue)
+    - Low Confidence or Rules Fail → Publishes to Service Bus (rejection-queue)
 
 - Notification Service:
   - Sends notification to relavent service/people to perform next step
 
+- ServiceNow Workflow:
+  - Created case in ServiceNow for manual review or rejection
+
 ```tech - **F1S3: System interaction**
 [Document Processing Service - .NET Core 8 Microservice]
-**Hosting:** Azure Kubernetes Service (AKS) with Horizontal Pod Autoscaler (HPA) based on CPU/memory
-**Service Bus Consumption:** .NET SDK with IMessageReceiver interface
-  - Event-driven processing: ServiceBusTrigger attribute binds to queue
-  - Message handling pattern: CompleteMessageAsync() for success, AbandonMessageAsync() for transient failures
-  - Dead-letter queue: Messages failing after 10 delivery attempts moved to validation-queue-deadletter
-  - Consumer group: validation-consumer with max concurrent calls: 32
-→ Input: Consumes message from Azure Service Bus (validation-queue) published by Azure Function Document Processor
-→ Actions:
-   • Retrieves Set A (original submission), Set B (barcode), Set C (OCR) from Azure SQL using EF Core (GET query with joins)
-   • Data reconciliation algorithm:
+- Input: Consumes message from Azure Service Bus (validation-queue) published by Azure
+Function Document Processor
+- Actions:
+   - Retrieves Set A (original submission), Set B (barcode), Set C (OCR) from Azure SQL using EF Core (GET query with joins)
+   - Data reconciliation algorithm:
      - Company name fuzzy matching (Levenshtein distance <3 chars)
      - Tax ID exact match validation
      - Bank account number comparison
      - Confidence scoring: High >95% match, Medium 85-95%, Low <85%
-   • Creates finalized entity set (Set D) with merged/corrected data using rule-based conflict resolution:
+   - Creates finalized entity set (Set D) with merged/corrected data using rule-based conflict resolution:
      - If Set A = Set B = Set C → Use common value (confidence: 100%)
      - If Set B = Set C ≠ Set A → Trust scanned documents (barcode + OCR agree, confidence: 95%)
      - If Set A = Set B ≠ Set C → Trust original + barcode (OCR error likely, confidence: 90%)
      - If all 3 differ → Flag for manual review (confidence: <85%), use Set B as default
      - Priority order: Set B (barcode) > Set C (OCR) > Set A (manual entry) when conflicts exist
-   • Saves Set D to Azure SQL (FinalizedEntities table) with reconciliation metadata:
+   - Saves Set D to Azure SQL (FinalizedEntities table) with reconciliation metadata:
      - Field-level confidence scores per attribute
      - Source selection flags (which set chosen: A/B/C)
      - Mismatch indicators for manual review
      - Reconciliation timestamp and algorithm version
-→ Output: Set D created with metadata, ready for rule validation
+   - Publishes set comparision completion message to Azure Service Bus (business-rule-validation-queue) with JSON payload:
+     {submissionId, finalizedData, comparisonResults, confidenceScores, timestamp}
+- Output: Set D created with metadata, ready for rule validation
 
 [Business Rule Validation Engine - .NET Core 8 Microservice]
-**Hosting:** Azure Kubernetes Service (AKS) with Horizontal Pod Autoscaler (HPA)
-**Microservice Communication:**
-  - Receives Set D data via Azure Service Bus message or synchronous REST API call from Document Processing Service
-  - Calls Compliance Service synchronously via REST (POST /api/compliance/screen)
-  - Calls ServiceNow REST API for workflow creation (POST /api/now/workflow/review)
-→ Input: Set D entity data from Document Processing Service (from Azure SQL FinalizedEntities table)
+→ Input: Consumes messages from Azure Service Bus (`business-rule-validation-queue`) published by the Document Processing Service.
 → Actions:
    • Fetches business rules from ServiceNow REST API (GET /api/now/table/business_rules?type=onboarding&active=true)
-   • Rules cached in Redis (15-min TTL) to reduce ServiceNow API calls
-   • Executes validation rules using .NET Rules Engine library:
+   • Caches rules in Redis (15-min TTL) to improve performance and reduce ServiceNow API call frequency.
+   • Executes validation rules using the .NET Rules Engine library:
      - Tax ID format verification (regex patterns)
      - Duplicate client check (SQL query: SELECT COUNT(*) FROM ClientProfiles WHERE TaxID = @taxId)
-     - Sanction list screening via Compliance Service REST API (POST /api/compliance/screen with client details)
-   • Aggregates validation results (pass/fail per rule, overall confidence score)
+     - Sanction list screening: Calls Compliance Service REST API (POST /api/compliance/screen) with client details for screening.
+   • Aggregates validation results (pass/fail per rule, overall confidence score for the validation process)
    • Decision routing logic:
-     - High Confidence + All Rules Pass → Publishes to Azure Service Bus (auto-approval-queue)
-     - Medium Confidence OR Partial Rules → Publishes to Azure Service Bus (manual-review-queue) + Calls ServiceNow API
-     - Low Confidence OR Rules Fail → Publishes to Azure Service Bus (rejection-queue)
-   • For manual-review cases: Calls ServiceNow REST API (POST /api/now/workflow/review) with Sets A/B/C/D for case creation
+     - High Confidence + All Rules Pass → Publishes to Azure Service Bus (auto-approval-topic with onboarding-subscriptions and notification-subscriptions)
+     - Medium Confidence OR Partial Rules → Publishes to Azure Service Bus (manual-review-queue) + Calls ServiceNow API to create a manual review case.
+     - Low Confidence OR Rules Fail → Publishes to Azure Service Bus (rejection-queue) + Calls ServiceNow API to create a rejection case.
+   • ServiceNow API Calls:
+      - For manual-review cases: Calls ServiceNow REST API (POST /api/now/workflow/review) with Sets A/B/C/D for case creation
+      - For rejection cases: Calls ServiceNow REST API (POST /api/now/workflow/rejection) with Sets A/B/C/D, validationResults, and rejection reason for case creation
    • Logs event to Azure Cosmos DB (event sourcing pattern for audit trail)
 → Output: Routed messages to appropriate Service Bus queues, ServiceNow case created for manual reviews
 
 [Notification Service - .NET Core 8 Microservice]
-**Hosting:** Azure Kubernetes Service (AKS) with Horizontal Pod Autoscaler (HPA)
-→ Input: Listens to all routing queues on Azure Service Bus (auto-approval-queue, manual-review-queue, rejection-queue) published by Business Rule Validation Engine
+→ Input: Listens to all routing queues on Azure Service Bus (auto-approval-topic with notification-subscriptions, manual-review-queue, rejection-queue) published by Business Rule Validation Engine
 → Actions:
    • Sends email notifications via SendGrid API (approval confirmations, review requests)
    • SignalR broadcasts real-time status updates to Admin Dashboard (React TypeScript) via WebSocket connections
    • Logs notification delivery status to Azure SQL (NotificationDelivery table)
 → Output: Multi-channel notifications delivered (email, SignalR push, SMS)
+
+[ServiceNow Workflow - Case Creation (Manual Review & Rejection)]
+→ Input: REST API call from Business Rule Validation Engine:
+   - Manual Review: POST /api/now/workflow/review with Sets A/B/C/D comparison data and validation results.
+   - Rejection: POST /api/now/workflow/rejection with Sets A/B/C/D, validation results, and rejection reason.
+→ Actions:
+   • Initiates the appropriate workflow in ServiceNow:
+      - **Manual Review Workflow**:
+         - Creates a new manual review case in ServiceNow with the following details:
+           - Sets A/B/C/D comparison data.
+           - Validation results (pass/fail per rule, overall confidence score).
+           - Additional metadata (submission ID, timestamps, etc.).
+         - Assigns the case to the appropriate "maker" based on predefined rules (e.g., department, region).
+         - Sends notifications (email/SMS) to the assigned maker with a link to the case.
+         - Tracks SLA for manual review (e.g., 4-hour resolution target).
+      - **Rejection Workflow**:
+         - Creates a new rejection case in ServiceNow with the following details:
+           - Sets A/B/C/D comparison data.
+           - Validation results (pass/fail per rule, overall confidence score).
+           - Rejection reason provided by the Business Rule Validation Engine.
+           - Additional metadata (submission ID, timestamps, etc.).
+         - Assigns the case to the appropriate "relationship manager" or team for further action.
+         - Sends notifications (email/SMS) to the assigned relationship manager with a link to the case.
+         - Tracks SLA for rejection resolution (e.g., 24-hour resolution target).
+→ Output: Case created in ServiceNow (manual review or rejection), notifications sent to the assigned personnel.
 ```
 
 #### Stage 4: Auto-Approval Path (High Confidence)
@@ -261,7 +294,7 @@ Integrated payment processing system handling corporate remittance with automate
 ```tech - **F1S4: System interaction**
 [Client Onboarding Service - .NET Core 8 Microservice]
 **Hosting:** Azure Kubernetes Service (AKS) with Horizontal Pod Autoscaler (HPA)
-→ Input: Consumes message from Azure Service Bus (auto-approval-queue) published by Business Rule Validation Engine
+→ Input: Consumes message from Azure Service Bus (auto-approval-topic, onboarding-subscriptions) published by Business Rule Validation Engine
 → Actions:
    • Retrieves approved Set D data from Azure SQL (FinalizedEntities table)
    • Creates client profile in Azure SQL (ClientProfiles table) using EF Core (INSERT with transaction)
@@ -272,7 +305,7 @@ Integrated payment processing system handling corporate remittance with automate
 → Output: Client profile created, confirmation notification sent
 ```
 
-Stage 5: Manual Review Path (Medium/Low Confidence) & Rejection & Remediation Path
+#### Stage 5: Manual Review Path (Medium/Low Confidence) & Rejection & Remediation Path
 
 - ServiceNow Platform:
   - Initiate workflow based on call request, inserts record in request queue and sends notification
@@ -637,20 +670,38 @@ Stage 8: Continuous Learning & Feedback Loop
 └─────────────────────────────────────────────────────────────┘
 ↓
 ┌─────────────────────────────────────────────────────────────┐
-│ BUSINESS LOGIC LAYER (Microservices) │
-│ │
-│ ┌──────────────────┐ ┌──────────────────┐ │
-│ │ Payment Service │ │ Document Service │ │
-│ │ - Validation │ │ - AI Processing │ │
-│ │ - Routing Engine │ │ - OCR/NLP │ │
-│ │ - Fee Calculation│ │ - Data Extract │ │
-│ └──────────────────┘ └──────────────────┘ │
-│ │
-│ ┌──────────────────┐ ┌──────────────────┐ │
-│ │ Compliance Svc │ │ Notification Svc │ │
-│ │ - AML Screening │ │ - Email/SMS │ │
-│ │ - Sanction Check │ │ - Push Notify │ │
-│ └──────────────────┘ └──────────────────┘ │
+│ BUSINESS LOGIC LAYER (Microservices)                       │
+│                                                              │
+│ ┌──────────────────┐  ┌──────────────────┐                │
+│ │ Payment Service  │  │ Document Service │                │
+│ │ - Validation     │  │ - AI Processing  │                │
+│ │ - Routing Engine │  │ - OCR/NLP        │                │
+│ │ - Fee Calculation│  │ - Data Extract   │                │
+│ └──────────────────┘  └──────────────────┘                │
+│                                                              │
+│ ┌──────────────────┐  ┌──────────────────┐                │
+│ │ Compliance Svc   │  │ Notification Svc │                │
+│ │ - AML Screening  │  │ - Email/SMS      │                │
+│ │ - Sanction Check │  │ - Push Notify    │                │
+│ └──────────────────┘  └──────────────────┘                │
+│                                                              │
+│ ┌──────────────────┐  ┌──────────────────┐                │
+│ │ File Upload Svc  │  │ Audit Trail Svc  │                │
+│ │ - Blob Upload    │  │ - Event Logging  │                │
+│ │ - SAS Tokens     │  │ - Query API      │                |
+│ └──────────────────┘  └──────────────────┘                │
+│                                                              │
+│ ┌──────────────────┐  ┌──────────────────┐                │
+│ │ Orchestration Svc│  │ Business Rule Svc│                │
+│ │ - Saga Mgmt      │  │ - Rule Execution │                │
+│ │ - Workflow Coord │  │ - Rule Caching   │                │
+│ └──────────────────┘  └──────────────────┘                │
+│                                                              │
+│ ┌──────────────────┐  ┌──────────────────┐                │
+│ │ Error Handling Svc│  │ Reporting Svc   │                │
+│ │ - Retry Logic     │  │ - Compliance     │                │
+│ │ - Error Logging   │  │ - Performance    │                │
+│ └──────────────────┘  └──────────────────┘                │
 └─────────────────────────────────────────────────────────────┘
 ↓
 ┌─────────────────────────────────────────────────────────────┐
@@ -706,23 +757,52 @@ Stage 8: Continuous Learning & Feedback Loop
    - Supports data comparison and correction workflows
    - Redis caching for rules (15-minute TTL)
 
-6. **ServiceNow Platform (External Enterprise System)**
-   - Enterprise workflow orchestration and business process management platform
-   - **Technology Stack**:
-     - Platform: ServiceNow Cloud (SaaS)
-     - Workflow Development: ServiceNow Flow Designer (low-code visual workflow builder)
-     - Business Rules: JavaScript (server-side scripting engine)
-     - UI Customization: ServiceNow UI Builder (drag-and-drop interface designer)
-     - Forms & Tables: Declarative configuration (no-code table/form designer)
-     - REST API: ServiceNow Scripted REST APIs (JavaScript-based endpoints)
-   - Business rule configuration and management (UI-based rule definition by business users)
-   - Workflow execution engine (auto-approval, manual review routing, multi-tier approvals)
-   - Repair queue management for data corrections and exception handling
-   - Approval workflows for corrections (manager/VP approval based on thresholds)
-   - Multi-channel notifications (email, SMS, in-app alerts)
-   - SLA tracking and timeout handling with auto-escalation
-   - Complete audit trail and compliance reporting
-   - Integration via REST API with internal microservices
+6. **Audit Trail Service (Azure Cosmos DB)**
+   - Logs complete payment lifecycle as an event stream
+   - Provides immutable audit trail for compliance and reporting
+   - Supports querying for historical payment events
+
+7. **ML Data Collection Service (Python/C# Integration)**
+   - Stores AI extraction results for model improvement in Azure SQL
+   - Captures document type classification and logs extraction confidence per field
+   - Prepares data for analysis and model retraining
+
+8. **ML Pattern Analysis Service (Python ML Pipeline)**
+   - Analyzes patterns in document processing and validation outcomes
+   - Identifies areas for improvement in AI models and business rules
+   - Generates comprehensive analysis reports with recommendations
+
+9. **ML Training Dataset Builder (Python)**
+   - Builds enhanced training datasets for AI model retraining
+   - Creates dataset manifest files with document URLs and labels
+
+10. **Azure AI Document Intelligence - Model Retraining Pipeline**
+    - Retrains custom Azure AI models using enhanced training datasets
+    - Archives old models for rollback capability
+    - Deploys improved AI models to production
+
+11. **Business Rule Tuning Service (.NET Core 8)**
+    - Adjusts confidence thresholds based on historical accuracy
+    - Updates fuzzy matching tolerance and validation rules
+    - Integrates with ServiceNow for real-time rule updates and cache invalidation
+
+12. **ServiceNow Platform (External Enterprise System)**
+    - Enterprise workflow orchestration and business process management platform
+    - **Technology Stack**:
+      - Platform: ServiceNow Cloud (SaaS)
+      - Workflow Development: ServiceNow Flow Designer (low-code visual workflow builder)
+      - Business Rules: JavaScript (server-side scripting engine)
+      - UI Customization: ServiceNow UI Builder (drag-and-drop interface designer)
+      - Forms & Tables: Declarative configuration (no-code table/form designer)
+      - REST API: ServiceNow Scripted REST APIs (JavaScript-based endpoints)
+    - Business rule configuration and management (UI-based rule definition by business users)
+    - Workflow execution engine (auto-approval, manual review routing, multi-tier approvals)
+    - Repair queue management for data corrections and exception handling
+    - Approval workflows for corrections (manager/VP approval based on thresholds)
+    - Multi-channel notifications (email, SMS, in-app alerts)
+    - SLA tracking and timeout handling with auto-escalation
+    - Complete audit trail and compliance reporting
+    - Integration via REST API with internal microservices
 
 **Data Exchange Formats:**
 
@@ -754,6 +834,21 @@ Stage 8: Continuous Learning & Feedback Loop
   - Each saga step publishes events to Azure Service Bus, saga coordinator tracks state in Azure SQL Database, timeout handlers trigger compensation logic
 - **Circuit Breaker**: Resilience pattern for external system calls (SWIFT, ServiceNow)
 - **CQRS**: Separate read/write models for payment queries vs command execution
+
+**Service Bus Consumption Pattern**
+
+- **Event-driven processing**: The `ServiceBusTrigger` attribute is used to bind the microservice to the Service Bus queue, enabling automatic message processing as they arrive.
+- **Message handling pattern**:
+  - `CompleteMessageAsync()`: Used to acknowledge successful processing of a message, ensuring it is removed from the queue.
+  - `AbandonMessageAsync()`: Used for transient failures, allowing the message to be retried based on the retry policy configured for the queue.
+- **Dead-letter queue**: Messages that fail after 10 delivery attempts are automatically moved to the dead-letter queue (`<queue-name>-deadletter`) for further investigation.
+- **Consumer group**: Each microservice consuming a queue is assigned a dedicated consumer group to ensure scalability and isolation. The `maxConcurrentCalls` parameter is configured to 32 to optimize throughput while maintaining system stability.
+- **Error handling and retries**:
+  - Transient errors are retried based on the retry policy configured in the Service Bus.
+  - Permanent errors are logged and moved to the dead-letter queue for manual review.
+- **Monitoring and observability**:
+  - Azure Monitor and Application Insights are used to track message processing metrics, such as success rate, failure rate, and processing latency.
+  - Alerts are configured for dead-letter queue growth and processing delays.
 
 ## Technical Implementation Details
 

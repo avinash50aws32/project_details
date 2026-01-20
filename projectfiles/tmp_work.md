@@ -102,7 +102,7 @@ Stage 1: Form Submission & Document Upload
          - No Azure storage costs incurred for incomplete submissions
 
    • Backend processes upload (only after completeness validation passes):
-     - Uploads documents to Azure Blob Storage container (onboarding-docs) with unique tracking ID
+     - Calls File Upload Microservice to handle document upload to Azure Blob Storage container (onboarding-docs) with unique tracking ID
      - Publishes message to Azure Service Bus queue (onboarding-processing-queue) with JSON payload:
        {submissionId, blobUrls[], documentTypes[], uploadTimestamp}
 → Output: Returns upload confirmation with tracking ID to client, message queued for processing
@@ -411,7 +411,8 @@ Stage 1: Payment Request Initiation & Document Upload
 
    • Backend processes upload (only after completeness validation passes):
      - Generates unique payment reference ID (format: PAY-{yyyy}-{sequential})
-     - Uploads documents to Azure Blob Storage container (payment-docs-{yyyy}/{mm})
+    //  - Uploads documents to Azure Blob Storage container (payment-docs-{yyyy}/{mm})
+    - Calls File Upload Microservice to handle document upload to Azure Blob Storage container (payment-docs-{yyyy}/{mm}) with unique tracking ID
      - Document metadata saved to Azure SQL (PaymentDocuments table):
        {paymentId, documentType, blobUrl, fileName, fileSize, uploadTimestamp, uploadedBy}
    • Updates payment status: Draft → PendingProcessing
@@ -1228,11 +1229,11 @@ Stage 6: Payment Execution
      ^^^ ^^^^^^^^^ ^^^^^^^^^^^^^^ ^^^^^^^^^^^ ^^^ ^^^^^^^^^^                  ^^^^^^^^^
      |   |         |               |           |   |                           |
      |   |         |               |           |   Originator ID              Trace Number
-     |   |         |               |           Currency
-     |   |         |               Amount (with implied decimal)
-     |   |         Beneficiary Account Number
-     |   Routing Transit Number
-     Transaction Code (22=checking credit)
+     |   |         |               |           |   Currency
+     |   |         |               |           |   Amount (with implied decimal)
+     |   |         |               |           |   Beneficiary Account Number
+     |   |         |               |           Routing Transit Number
+     |   |         Transaction Code (22=checking credit)
      ```
    - Transaction code selection:
      * 22: Checking account credit
@@ -1942,6 +1943,7 @@ Stage 8: Continuous Learning & Feedback Loop
 │ - API Analytics & Monitoring                               │
 └─────────────────────────────────────────────────────────────┘
                             ↓
+
 ┌─────────────────────────────────────────────────────────────┐
 │ BUSINESS LOGIC LAYER (Microservices)                       │
 │                                                              │
@@ -1957,7 +1959,30 @@ Stage 8: Continuous Learning & Feedback Loop
 │ │ - AML Screening  │  │ - Email/SMS      │                │
 │ │ - Sanction Check │  │ - Push Notify    │                │
 │ └──────────────────┘  └──────────────────┘                │
+│                                                              │
+│ ┌──────────────────┐  ┌──────────────────┐                │
+│ │ File Upload Svc  │  │ Audit Trail Svc  │                │
+│ │ - Blob Upload    │  │ - Event Logging  │                │
+│ │ - SAS Tokens     │  │ - Query API      │                |
+│ └──────────────────┘  └──────────────────┘                │
+│                                                              │
+│ ┌──────────────────┐  ┌──────────────────┐                │
+│ │ Orchestration Svc│  │ Business Rule Svc│                │
+│ │ - Saga Mgmt      │  │ - Rule Execution │                │
+│ │ - Workflow Coord │  │ - Rule Caching   │                │
+│ └──────────────────┘  └──────────────────┘                │
+│                                                              │
+│ ┌──────────────────┐  ┌──────────────────┐                │
+│ │ Error Handling Svc│  │ Reporting Svc   │                │
+│ │ - Retry Logic     │  │ - Compliance     │                │
+│ │ - Error Logging   │  │ - Performance    │                │
+│ └──────────────────┘  └──────────────────┘                │
 └─────────────────────────────────────────────────────────────┘
+
+
+
+
+
                             ↓
 ┌─────────────────────────────────────────────────────────────┐
 │ INTEGRATION LAYER                                           │
@@ -2011,23 +2036,52 @@ Stage 8: Continuous Learning & Feedback Loop
    - Supports data comparison and correction workflows
    - Redis caching for rules (15-minute TTL)
 
-6. **ServiceNow Platform (External Enterprise System)**
-   - Enterprise workflow orchestration and business process management platform
-   - **Technology Stack**:
-     - Platform: ServiceNow Cloud (SaaS)
-     - Workflow Development: ServiceNow Flow Designer (low-code visual workflow builder)
-     - Business Rules: JavaScript (server-side scripting engine)
-     - UI Customization: ServiceNow UI Builder (drag-and-drop interface designer)
-     - Forms & Tables: Declarative configuration (no-code table/form designer)
-     - REST API: ServiceNow Scripted REST APIs (JavaScript-based endpoints)
-   - Business rule configuration and management (UI-based rule definition by business users)
-   - Workflow execution engine (auto-approval, manual review routing, multi-tier approvals)
-   - Repair queue management for data corrections and exception handling
-   - Approval workflows for corrections (manager/VP approval based on thresholds)
-   - Multi-channel notifications (email, SMS, in-app alerts)
-   - SLA tracking and timeout handling with auto-escalation
-   - Complete audit trail and compliance reporting
-   - Integration via REST API with internal microservices
+6. **Audit Trail Service (Azure Cosmos DB)**
+   - Logs complete payment lifecycle as an event stream
+   - Provides immutable audit trail for compliance and reporting
+   - Supports querying for historical payment events
+
+7. **ML Data Collection Service (Python/C# Integration)**
+   - Stores AI extraction results for model improvement in Azure SQL
+   - Captures document type classification and logs extraction confidence per field
+   - Prepares data for analysis and model retraining
+
+8. **ML Pattern Analysis Service (Python ML Pipeline)**
+   - Analyzes patterns in document processing and validation outcomes
+   - Identifies areas for improvement in AI models and business rules
+   - Generates comprehensive analysis reports with recommendations
+
+9. **ML Training Dataset Builder (Python)**
+   - Builds enhanced training datasets for AI model retraining
+   - Creates dataset manifest files with document URLs and labels
+
+10. **Azure AI Document Intelligence - Model Retraining Pipeline**
+    - Retrains custom Azure AI models using enhanced training datasets
+    - Archives old models for rollback capability
+    - Deploys improved AI models to production
+
+11. **Business Rule Tuning Service (.NET Core 8)**
+    - Adjusts confidence thresholds based on historical accuracy
+    - Updates fuzzy matching tolerance and validation rules
+    - Integrates with ServiceNow for real-time rule updates and cache invalidation
+
+12. **ServiceNow Platform (External Enterprise System)**
+    - Enterprise workflow orchestration and business process management platform
+    - **Technology Stack**:
+      - Platform: ServiceNow Cloud (SaaS)
+      - Workflow Development: ServiceNow Flow Designer (low-code visual workflow builder)
+      - Business Rules: JavaScript (server-side scripting engine)
+      - UI Customization: ServiceNow UI Builder (drag-and-drop interface designer)
+      - Forms & Tables: Declarative configuration (no-code table/form designer)
+      - REST API: ServiceNow Scripted REST APIs (JavaScript-based endpoints)
+    - Business rule configuration and management (UI-based rule definition by business users)
+    - Workflow execution engine (auto-approval, manual review routing, multi-tier approvals)
+    - Repair queue management for data corrections and exception handling
+    - Approval workflows for corrections (manager/VP approval based on thresholds)
+    - Multi-channel notifications (email, SMS, in-app alerts)
+    - SLA tracking and timeout handling with auto-escalation
+    - Complete audit trail and compliance reporting
+    - Integration via REST API with internal microservices
 
 **Data Exchange Formats:**
 

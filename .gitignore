@@ -15,6 +15,10 @@ temp*/
 *.swp
 *.swo
 *.~*
+tmp*.*
+temp*.*
+tmp*/
+temp*/
 
 # ===========================
 # Operating System Files
